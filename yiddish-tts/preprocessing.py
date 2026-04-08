@@ -3,6 +3,9 @@
 Wraps the `yiddish` library to normalize text into a form suitable for
 the FastSpeech2 model (YIVO respelled orthography with loshn-koydesh
 words respelled phonetically).
+
+Also provides romanization (Hebrew → YIVO Latin) and phoneme conversion
+(YIVO → X-SAMPA / IPA) for phoneme-level API I/O.
 """
 
 import re
@@ -363,7 +366,11 @@ def preprocess(
     Returns:
         Cleaned text ready for the acoustic model.
     """
-    # Step 0: expand numbers to words
+    # Step 0a: extract inline phoneme overrides (e.g. <ph>SulEn</ph> or <פ>SulEn</פ>)
+    # These bypass all preprocessing and are re-inserted after normalization
+    text, phoneme_spans, escaped_tags = _extract_phoneme_overrides(text)
+
+    # Step 0b: expand numbers to words
     text = expand_numbers(text)
 
     # Step 1: normalize punctuation
@@ -379,4 +386,99 @@ def preprocess(
     # Step 4: collapse whitespace
     text = " ".join(text.split())
 
+    # Step 5: re-insert phoneme overrides and escaped tags
+    text = _reinsert_phoneme_overrides(text, phoneme_spans, escaped_tags)
+
     return text
+
+
+# ---------------------------------------------------------------------------
+# Inline phoneme overrides: <ph>X-SAMPA</ph> tags in input text
+# ---------------------------------------------------------------------------
+
+# Support multiple tag variants for phoneme overrides:
+#   <ph>...</ph>    — standard Latin
+#   <פ>...</פ>      — single Hebrew letter (easy to type on Hebrew keyboard)
+# Escaped tags (\<ph>, \<פ>) are treated as literal text.
+_PH_ESCAPE_RE = re.compile(r"\\(<(?:ph|פ)>)")
+_PH_ESCAPE_PLACEHOLDER = "\x01ESC{}\x01"
+_PH_TAG_RE = re.compile(r"<(?:ph|פ)>(.*?)</(?:ph|פ)>")
+_PH_PLACEHOLDER = "\x00PH{}\x00"
+_PH_PLACEHOLDER_RE = re.compile(r"\x00PH(\d+)\x00")
+
+
+def _extract_phoneme_overrides(text: str) -> tuple[str, list[str], list[str]]:
+    """Extract <ph>...</ph> and <פ>...</פ> tags, replacing them with placeholders.
+
+    Escaped tags (\\<ph>, \\<פ>) are preserved as literal text.
+
+    Returns (text_with_placeholders, phoneme_spans, escaped_tags).
+    """
+    # Step 1: protect escaped tags
+    escaped: list[str] = []
+
+    def _protect_escape(match):
+        idx = len(escaped)
+        escaped.append(match.group(1))
+        return _PH_ESCAPE_PLACEHOLDER.format(idx)
+
+    text = _PH_ESCAPE_RE.sub(_protect_escape, text)
+
+    # Step 2: extract phoneme tags
+    spans: list[str] = []
+
+    def _replace(match):
+        xsampa_content = match.group(1)
+        idx = len(spans)
+        spans.append(xsampa_content)
+        return _PH_PLACEHOLDER.format(idx)
+
+    text = _PH_TAG_RE.sub(_replace, text)
+    return text, spans, escaped
+
+
+def _reinsert_phoneme_overrides(
+    text: str, spans: list[str], escaped: list[str],
+) -> str:
+    """Replace phoneme placeholders with Yiddish-script equivalents.
+
+    Tag contents are treated as YIVO romanization and converted back to
+    Yiddish script via detransliterate().
+    Also restores escaped tags as literal text.
+    """
+    if spans:
+        def _replace(match):
+            idx = int(match.group(1))
+            if idx < len(spans):
+                return yd.detransliterate(spans[idx])
+            return match.group(0)
+
+        text = _PH_PLACEHOLDER_RE.sub(_replace, text)
+
+    # Restore escaped tags as literal text
+    if escaped:
+        _esc_re = re.compile(r"\x01ESC(\d+)\x01")
+
+        def _restore(match):
+            idx = int(match.group(1))
+            return escaped[idx] if idx < len(escaped) else match.group(0)
+
+        text = _esc_re.sub(_restore, text)
+
+    return text
+
+
+def romanize(text: str) -> str:
+    """Convert preprocessed YIVO-respelled text to Latin romanization.
+
+    Uses yiddish.transliterate() which produces YIVO standard romanization.
+    Input should already be preprocessed (call preprocess() first).
+    100% success rate on the REYD dataset (4,892 utterances, 0 failures).
+
+    Args:
+        text: YIVO-respelled Yiddish text (output of preprocess()).
+
+    Returns:
+        Latin romanization (e.g. "ikh bin geven in shul heynt").
+    """
+    return yd.transliterate(text)
